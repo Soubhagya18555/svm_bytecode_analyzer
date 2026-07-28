@@ -1,10 +1,13 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use svm_bytecode_analyzer::{
-    analyze_anomalies, build_cfg, disassemble, format_instruction_line, load_elf,
+    analyze_anomalies, analyze_binary, build_cfg, disassemble, export_cfg, format_instruction_line,
+    load_elf, validate_bytecode, CfgExportFormat, ReportOptions,
 };
 use svm_bytecode_analyzer::anomaly_rules::format_report;
+use svm_bytecode_analyzer::binary_report::format_report_text;
 use svm_bytecode_analyzer::cfg_builder::cfg_summary;
+use svm_bytecode_analyzer::opcode_stats::compute_stats;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -27,9 +30,23 @@ enum Commands {
         /// Emit control flow graph summary
         #[arg(long)]
         cfg: bool,
+        /// Export CFG as DOT graph
+        #[arg(long)]
+        dot: bool,
         /// Emit JSON output
         #[arg(long)]
         json: bool,
+    },
+    /// Emit unified binary analysis report
+    Report {
+        /// Path to ELF binary or raw SBF bytecode
+        binary_file: PathBuf,
+        /// Emit JSON output
+        #[arg(long)]
+        json: bool,
+        /// Export CFG as DOT graph
+        #[arg(long)]
+        dot: bool,
     },
 }
 
@@ -55,12 +72,43 @@ fn run(cli: Cli) -> Result<(), String> {
         Commands::Disasm {
             binary_file,
             cfg,
+            dot,
             json,
-        } => disasm_command(&binary_file, cfg, json),
+        } => disasm_command(&binary_file, cfg, dot, json),
+        Commands::Report {
+            binary_file,
+            json,
+            dot,
+        } => report_command(&binary_file, json, dot),
     }
 }
 
-fn disasm_command(path: &PathBuf, emit_cfg: bool, emit_json: bool) -> Result<(), String> {
+fn report_command(path: &PathBuf, emit_json: bool, emit_dot: bool) -> Result<(), String> {
+    let elf = load_elf(path).map_err(|e| e.to_string())?;
+    let label = path.display().to_string();
+    let report = analyze_binary(&elf, &label, ReportOptions::default());
+
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!("{}", format_report_text(&report));
+    }
+
+    if emit_dot {
+        let disasm = disassemble(&elf.text, 0);
+        let cfg = build_cfg(&disasm);
+        let dot = export_cfg(&cfg, CfgExportFormat::Dot)?;
+        println!();
+        println!("{dot}");
+    }
+
+    Ok(())
+}
+
+fn disasm_command(path: &PathBuf, emit_cfg: bool, emit_dot: bool, emit_json: bool) -> Result<(), String> {
     let elf = load_elf(path).map_err(|e| e.to_string())?;
     let entry_offset = 0usize;
     let disasm = disassemble(&elf.text, entry_offset);
@@ -111,6 +159,18 @@ fn disasm_command(path: &PathBuf, emit_cfg: bool, emit_json: bool) -> Result<(),
         println!();
         println!("; control flow graph");
         println!("{}", cfg_summary(&cfg));
+
+        if emit_dot {
+            let dot = export_cfg(&cfg, CfgExportFormat::Dot)?;
+            println!();
+            println!("{dot}");
+        }
+
+        let stats = compute_stats(&disasm);
+        let validation = validate_bytecode(&disasm, &elf.text);
+        println!();
+        println!("; opcode stats: {} instructions, entropy {:.2} bits", stats.total_instructions, stats.entropy_bits);
+        println!("; validation: {}", if validation.is_valid { "pass" } else { "fail" });
     }
 
     if let Some(report) = anomalies {
